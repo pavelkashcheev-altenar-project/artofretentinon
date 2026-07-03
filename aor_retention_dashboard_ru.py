@@ -443,17 +443,22 @@ def main():
     avg_freebets = metrics_df["freebets_per_active_user"].mean()
     avg_max_coins = metrics_df["max_coins_per_active_user"].mean()
     median_roi = metrics_df["roi"].median()
+    mean_ggr_change = metrics_df["incremental_ggr_gross"].mean()
+    median_ggr_change_pct = metrics_df["gross_uplift_pct"].median()
     mean_net = metrics_df["incremental_ggr_net"].mean()
     positive_share = metrics_df["break_even_after_rewards"].mean()
     constraint_share = metrics_df["reward_budget_does_not_exceed_incremental_profit"].mean()
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Фрибеты / active user", number(avg_freebets))
     m2.metric("Макс. Coins / active user", number(avg_max_coins))
-    m3.metric("Медианный ROI", pct(median_roi))
-    m4.metric("Средний net GGR", eur(mean_net))
-    m5.metric("Прибыльные симуляции", pct(positive_share))
-    m6.metric("Лимит соблюдён", pct(constraint_share))
+    m3.metric("Изменение GGR", eur(mean_ggr_change), delta=pct(median_ggr_change_pct))
+    m4.metric("Медианный ROI", pct(median_roi))
+
+    m5, m6, m7 = st.columns(3)
+    m5.metric("Средний net GGR", eur(mean_net))
+    m6.metric("Прибыльные симуляции", pct(positive_share))
+    m7.metric("Лимит соблюдён", pct(constraint_share))
 
     st.markdown(
         """
