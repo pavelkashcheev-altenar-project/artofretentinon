@@ -560,9 +560,15 @@ def main():
         }
         pct_metrics = {"roi", "net_uplift_pct"}
 
+        # Pandas on Streamlit Cloud may reject assigning formatted strings
+        # into float columns. Build display columns as object/string columns first.
+        display_cols = ["p05", "mean", "median", "p95"]
+        for col in display_cols:
+            formatted[col] = formatted[col].astype("object")
+
         for idx, row in formatted.iterrows():
             metric = row["metric"]
-            for col in ["p05", "mean", "median", "p95"]:
+            for col in display_cols:
                 value = row[col]
                 if metric in money_metrics:
                     formatted.at[idx, col] = eur(value)
