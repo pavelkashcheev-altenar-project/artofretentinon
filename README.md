@@ -1,53 +1,54 @@
-# AOR — симуляционная модель на 30 дней
+# AOR — симуляционная модель с расчётом Coins и фрибетов
 
-Русская версия Streamlit-дашборда для проекта Art of Retention.
+Русская версия Streamlit-дашборда для Art of Retention.
 
-## Что делает модель
+## Главное изменение
 
-Дашборд позволяет вводить усреднённые данные букмекера:
+Coins и фрибеты больше не вводятся вручную.
 
-- количество ставок за период;
-- оборот;
-- GGR;
-- количество активных пользователей.
+Модель сама рассчитывает максимальное и плановое количество Coins / фрибетов на основе дополнительной прибыли от применения программы.
 
-После этого модель запускает минимум 200 симуляций на период 30 календарных дней, распределяет ставки между пользователями по усечённой модели Гаусса и рассчитывает:
+Главное ограничение:
 
-- среднее количество фрибетов на active user;
-- стоимость программы;
-- дополнительный gross GGR;
-- net incremental GGR;
-- ROI программы;
-- долю прибыльных симуляций;
-- break-even;
-- распределения ROI, стоимости программы и фрибетов на пользователя.
+```text
+Стоимость Coins / фрибетов не может превышать Incremental Gross GGR
+```
 
-## Запуск локально
+## Фиксированное правило текущей версии
+
+```text
+1 Coin = 1 фрибет = €1 бонусного бюджета
+```
+
+## Как считается
+
+```text
+Max Reward Budget = max(0, Incremental Gross GGR)
+
+Planned Reward Budget = Max Reward Budget × Reward Budget Share
+
+Coins = floor(Planned Reward Budget / €1)
+
+Freebets = Coins
+
+Program Cost = Coins × €1
+
+Net Incremental GGR = Incremental Gross GGR - Program Cost
+
+ROI = Net Incremental GGR / Program Cost
+```
+
+## Запуск
 
 ```bash
 pip install -r requirements.txt
 streamlit run aor_retention_dashboard_ru.py
 ```
 
-## Ключевые формулы
+## Файлы
 
 ```text
-average_stake = turnover / bets
-hold = GGR / turnover
-GGR_per_bet = GGR / bets
-
-total_freebets = completed_users * missions_per_completed_user * coins_per_completed_mission
-
-program_cost = total_freebets * freebet_value_eur * redemption_rate * freebet_cost_factor
-
-incremental_ggr_gross = AOR gross GGR - baseline GGR
-incremental_ggr_net = incremental_ggr_gross - program_cost
-
-ROI = incremental_ggr_net / program_cost
-```
-
-В этой версии модели используется курс:
-
-```text
-1 Coin = 1 фрибет
+aor_retention_dashboard_ru.py
+requirements.txt
+README.md
 ```
