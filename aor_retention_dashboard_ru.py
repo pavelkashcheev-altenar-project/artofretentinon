@@ -343,24 +343,24 @@ def main():
         total_bets = st.number_input(
             "Количество ставок за период",
             min_value=1,
-            value=100_000,
+            value=5_483_458,
             step=1_000,
         )
         turnover = st.number_input(
             "Оборот, €",
             min_value=1.0,
-            value=2_000_000.0,
+            value=40_834_160.0,
             step=10_000.0,
         )
         ggr = st.number_input(
             "GGR, €",
-            value=160_000.0,
+            value=4_682_582.0,
             step=5_000.0,
         )
         active_users = st.number_input(
             "Активные пользователи за период",
             min_value=1,
-            value=10_000,
+            value=372_326,
             step=100,
             help="Нужно для распределения ставок между пользователями.",
         )

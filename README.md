@@ -52,3 +52,13 @@ aor_retention_dashboard_ru.py
 requirements.txt
 README.md
 ```
+
+
+## Дефолтные исходные данные
+
+```text
+Ставок за период: 5,483,458
+Оборот: €40,834,160
+GGR: €4,682,582
+Users: 372,326
+```
