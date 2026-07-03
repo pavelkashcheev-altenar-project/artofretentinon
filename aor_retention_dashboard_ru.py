@@ -6,9 +6,7 @@ import streamlit as st
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
-
-DAYS = 30
-COIN_COST_EUR = 1.0  # Текущая версия: 1 Coin = 1 фрибет = €1 бонусного бюджета
+COIN_COST_EUR = 1.0  # 1 Coin = 1 freebet = EUR1 bonus budget
 
 
 @dataclass
@@ -18,1037 +16,485 @@ class ModelInputs:
     ggr: float
     active_users: int
     n_simulations: int
-
+    n_iterations: int
     target_share: float
     activation_rate: float
     completion_rate: float
-
-    avg_missions_per_completed_user: float
-    max_missions_per_completed_user: int
-
+    avg_missions_per_completed_user_per_iteration: float
+    max_missions_per_completed_user_per_iteration: int
     bet_count_uplift: float
     avg_stake_uplift: float
     hold_uplift: float
-
     reward_budget_share: float
-
-    initial_freebets_per_active_user: float
-    daily_freebet_spend_rate: float
-
+    freebet_spend_rate_per_iteration: float
     user_bet_cv: float
-    daily_volatility: float
+    iteration_volatility: float
     random_seed: int
 
 
-def safe_divide(a: float, b: float, default: float = 0.0) -> float:
+def safe_divide(a, b, default=0.0):
     return default if b == 0 else a / b
 
 
-def pct(x: float) -> str:
-    if pd.isna(x) or np.isinf(x):
-        return "n/a"
-    return f"{x * 100:,.1f}%"
+def pct(x):
+    return "n/a" if pd.isna(x) or np.isinf(x) else f"{x * 100:,.1f}%"
 
 
-def eur(x: float) -> str:
-    if pd.isna(x) or np.isinf(x):
-        return "n/a"
-    return f"€{x:,.0f}"
+def eur(x):
+    return "n/a" if pd.isna(x) or np.isinf(x) else f"€{x:,.0f}"
 
 
-def number(x: float, decimals: int = 2) -> str:
-    if pd.isna(x) or np.isinf(x):
-        return "n/a"
-    return f"{x:,.{decimals}f}"
+def number(x, decimals=2):
+    return "n/a" if pd.isna(x) or np.isinf(x) else f"{x:,.{decimals}f}"
 
 
-def generate_gaussian_user_weights(
-    rng: np.random.Generator,
-    active_users: int,
-    user_bet_cv: float,
-) -> np.ndarray:
-    """
-    Усечённое нормальное распределение интенсивности ставок по пользователям.
-    Среднее нормализуется к 1, чтобы сумма ставок совпадала с total_bets.
-    """
-    raw = rng.normal(loc=1.0, scale=user_bet_cv, size=active_users)
+def gaussian_user_weights(rng, active_users, cv):
+    raw = rng.normal(loc=1.0, scale=cv, size=active_users)
     weights = np.clip(raw, 0.01, None)
     return weights / weights.mean()
 
 
-def generate_daily_weights(
-    rng: np.random.Generator,
-    daily_volatility: float,
-    days: int = DAYS,
-) -> np.ndarray:
-    """
-    Дневная волатильность активности за 30 календарных дней.
-    Сумма весов равна 1.
-    """
-    raw = rng.normal(loc=1.0, scale=daily_volatility, size=days)
+def iteration_weights(rng, n_iterations, volatility):
+    raw = rng.normal(loc=1.0, scale=volatility, size=n_iterations)
     weights = np.clip(raw, 0.05, None)
     return weights / weights.sum()
 
 
-def simulate_missions(
-    rng: np.random.Generator,
-    completed_users: int,
-    avg_missions_per_completed_user: float,
-    max_missions_per_completed_user: int,
-    daily_weights: np.ndarray,
-) -> Tuple[int, np.ndarray, float]:
-    """
-    Один пользователь может выполнить больше одной миссии в месяц.
+def sample_completed_segment(rng, weights, active_users, target_share, activation_rate, completion_rate):
+    targeted = int(rng.binomial(active_users, target_share))
+    activated = int(rng.binomial(targeted, activation_rate))
+    completed = int(rng.binomial(activated, completion_rate))
+    if completed <= 0:
+        return targeted, activated, completed, 0.0
+    completed_weight_sum = float(rng.choice(weights, size=completed, replace=False).sum())
+    return targeted, activated, completed, completed_weight_sum
 
-    completed_users означает пользователей, которые выполнили хотя бы одну миссию.
-    Для таких пользователей количество миссий моделируется как:
-    1 + Poisson(avg_missions_per_completed_user - 1), с ограничением max_missions_per_completed_user.
-    """
+
+def simulate_missions(rng, completed_users, avg_missions, max_missions):
     if completed_users <= 0:
-        return 0, np.zeros(DAYS), 0.0
-
-    poisson_lambda = max(avg_missions_per_completed_user - 1.0, 0.0)
-    mission_counts = 1 + rng.poisson(lam=poisson_lambda, size=completed_users)
-    mission_counts = np.clip(mission_counts, 1, max_missions_per_completed_user)
-
-    completed_missions_total = int(mission_counts.sum())
-    daily_completed_missions = rng.multinomial(completed_missions_total, daily_weights)
-
-    actual_avg_missions = safe_divide(completed_missions_total, completed_users)
-
-    return completed_missions_total, daily_completed_missions.astype(float), actual_avg_missions
+        return 0, 0.0
+    lam = max(avg_missions - 1.0, 0.0)
+    counts = 1 + rng.poisson(lam=lam, size=completed_users)
+    counts = np.clip(counts, 1, max_missions)
+    total = int(counts.sum())
+    return total, safe_divide(total, completed_users)
 
 
-def simulate_freebet_balances(
-    daily_aor_freebets_issued: np.ndarray,
-    initial_freebets_total: float,
-    daily_freebet_spend_rate: float,
-) -> pd.DataFrame:
-    """
-    Пользователи могут тратить как стартовые фрибеты, так и фрибеты, полученные во время симуляции.
+def run_single_simulation(rng, inp: ModelInputs, sim_id: int) -> Tuple[Dict, pd.DataFrame]:
+    avg_stake = safe_divide(inp.turnover, inp.total_bets)
+    hold = safe_divide(inp.ggr, inp.turnover)
+    weights = gaussian_user_weights(rng, inp.active_users, inp.user_bet_cv)
+    iter_weights = iteration_weights(rng, inp.n_iterations, inp.iteration_volatility)
 
-    Упрощение v1:
-    - стартовый баланс и AOR-баланс учитываются отдельно;
-    - каждый день тратится заданная доля доступного баланса;
-    - новые AOR-фрибеты становятся доступными в день выдачи.
-    """
-    initial_balance = float(initial_freebets_total)
-    aor_balance = 0.0
-
+    freebet_balance = 0.0  # на старте у пользователей 0 фрибетов
     rows = []
 
-    for day_idx, issued in enumerate(daily_aor_freebets_issued, start=1):
-        aor_balance += float(issued)
+    for i, w in enumerate(iter_weights, start=1):
+        base_bets = inp.total_bets * w
+        base_turnover = inp.turnover * w
+        base_ggr = inp.ggr * w
 
-        initial_spent = initial_balance * daily_freebet_spend_rate
-        aor_spent = aor_balance * daily_freebet_spend_rate
-
-        initial_balance -= initial_spent
-        aor_balance -= aor_spent
-
-        rows.append(
-            {
-                "day": day_idx,
-                "initial_freebets_spent": initial_spent,
-                "aor_freebets_issued": float(issued),
-                "aor_freebets_spent": aor_spent,
-                "total_freebets_spent": initial_spent + aor_spent,
-                "initial_freebet_balance_end": initial_balance,
-                "aor_freebet_balance_end": aor_balance,
-                "total_freebet_balance_end": initial_balance + aor_balance,
-            }
+        targeted, activated, completed, completed_weight_sum = sample_completed_segment(
+            rng, weights, inp.active_users, inp.target_share, inp.activation_rate, inp.completion_rate
         )
 
-    return pd.DataFrame(rows)
+        completed_base_bets = base_bets * safe_divide(completed_weight_sum, inp.active_users)
+        non_completed_base_bets = base_bets - completed_base_bets
+        completed_base_turnover = completed_base_bets * avg_stake
+        non_completed_base_turnover = non_completed_base_bets * avg_stake
 
+        bet_mult = 1.0 + inp.bet_count_uplift
+        stake_mult = 1.0 + inp.avg_stake_uplift
+        hold_mult = 1.0 + inp.hold_uplift
 
-def run_single_simulation(
-    rng: np.random.Generator,
-    inputs: ModelInputs,
-    sim_id: int,
-) -> Tuple[Dict, pd.DataFrame]:
-    base_avg_stake = safe_divide(inputs.turnover, inputs.total_bets)
-    base_hold = safe_divide(inputs.ggr, inputs.turnover)
+        aor_bets = non_completed_base_bets + completed_base_bets * bet_mult
+        aor_turnover = non_completed_base_turnover + completed_base_turnover * bet_mult * stake_mult
+        aor_ggr_gross = (
+            non_completed_base_turnover * hold
+            + completed_base_turnover * bet_mult * stake_mult * hold * hold_mult
+        )
+        inc_ggr = aor_ggr_gross - base_ggr
 
-    user_weights = generate_gaussian_user_weights(
-        rng=rng,
-        active_users=inputs.active_users,
-        user_bet_cv=inputs.user_bet_cv,
-    )
+        missions, avg_missions_actual = simulate_missions(
+            rng,
+            completed,
+            inp.avg_missions_per_completed_user_per_iteration,
+            inp.max_missions_per_completed_user_per_iteration,
+        )
 
-    user_bets_30d = (inputs.total_bets / inputs.active_users) * user_weights
+        max_reward_budget = max(0.0, inc_ggr)
+        planned_reward_budget = max_reward_budget * inp.reward_budget_share
+        coins_issued = np.floor(planned_reward_budget / COIN_COST_EUR) if missions > 0 else 0.0
+        freebets_issued = coins_issued
 
-    targeted = rng.random(inputs.active_users) < inputs.target_share
-    activated = targeted & (rng.random(inputs.active_users) < inputs.activation_rate)
-    completed = activated & (rng.random(inputs.active_users) < inputs.completion_rate)
+        balance_start = freebet_balance
+        balance_after_issue = balance_start + freebets_issued
+        freebets_spent = balance_after_issue * inp.freebet_spend_rate_per_iteration
+        balance_end = balance_after_issue - freebets_spent
+        freebet_balance = balance_end
 
-    targeted_users = int(targeted.sum())
-    activated_users = int(activated.sum())
-    completed_users = int(completed.sum())
+        cost_spent = freebets_spent * COIN_COST_EUR
+        cost_issued = freebets_issued * COIN_COST_EUR
+        net_after_spent = inc_ggr - cost_spent
+        conservative_net = inc_ggr - cost_issued
 
-    completed_base_bets = float(user_bets_30d[completed].sum())
-    non_completed_base_bets = float(inputs.total_bets - completed_base_bets)
-
-    completed_base_turnover = completed_base_bets * base_avg_stake
-    non_completed_base_turnover = non_completed_base_bets * base_avg_stake
-
-    bet_multiplier = 1.0 + inputs.bet_count_uplift
-    stake_multiplier = 1.0 + inputs.avg_stake_uplift
-    hold_multiplier = 1.0 + inputs.hold_uplift
-
-    baseline_bets = float(inputs.total_bets)
-    aor_bets = non_completed_base_bets + completed_base_bets * bet_multiplier
-
-    baseline_turnover = float(inputs.turnover)
-    aor_turnover = non_completed_base_turnover + completed_base_turnover * bet_multiplier * stake_multiplier
-
-    baseline_ggr = float(inputs.ggr)
-    aor_ggr_gross = (
-        non_completed_base_turnover * base_hold
-        + completed_base_turnover * bet_multiplier * stake_multiplier * base_hold * hold_multiplier
-    )
-
-    incremental_ggr_gross = aor_ggr_gross - baseline_ggr
-
-    daily_weights = generate_daily_weights(
-        rng=rng,
-        daily_volatility=inputs.daily_volatility,
-        days=DAYS,
-    )
-
-    completed_missions_total, daily_completed_missions, actual_avg_missions = simulate_missions(
-        rng=rng,
-        completed_users=completed_users,
-        avg_missions_per_completed_user=inputs.avg_missions_per_completed_user,
-        max_missions_per_completed_user=inputs.max_missions_per_completed_user,
-        daily_weights=daily_weights,
-    )
-
-    # Главное ограничение модели:
-    # максимальное количество Coins / фрибетов не может стоить больше,
-    # чем дополнительная прибыль от применения программы.
-    max_reward_budget = max(0.0, incremental_ggr_gross)
-    planned_reward_budget = max_reward_budget * inputs.reward_budget_share
-
-    max_coins_total = np.floor(max_reward_budget / COIN_COST_EUR)
-    coins_total = np.floor(planned_reward_budget / COIN_COST_EUR)
-
-    # Если миссий нет, выдавать Coins некуда.
-    if completed_missions_total <= 0:
-        coins_total = 0.0
-
-    freebets_issued_total = coins_total  # 1 Coin = 1 фрибет
-    coins_per_completed_mission = safe_divide(coins_total, completed_missions_total)
-    freebets_per_completed_mission = coins_per_completed_mission
-
-    if completed_missions_total > 0:
-        daily_aor_freebets_issued = freebets_issued_total * daily_completed_missions / completed_missions_total
-    else:
-        daily_aor_freebets_issued = np.zeros(DAYS)
-
-    initial_freebets_total = inputs.initial_freebets_per_active_user * inputs.active_users
-
-    freebet_daily = simulate_freebet_balances(
-        daily_aor_freebets_issued=daily_aor_freebets_issued,
-        initial_freebets_total=initial_freebets_total,
-        daily_freebet_spend_rate=inputs.daily_freebet_spend_rate,
-    )
-
-    initial_freebets_spent_total = float(freebet_daily["initial_freebets_spent"].sum())
-    aor_freebets_spent_total = float(freebet_daily["aor_freebets_spent"].sum())
-    total_freebets_spent = float(freebet_daily["total_freebets_spent"].sum())
-
-    initial_freebets_end_balance = float(freebet_daily["initial_freebet_balance_end"].iloc[-1])
-    aor_freebets_end_balance = float(freebet_daily["aor_freebet_balance_end"].iloc[-1])
-    total_freebets_end_balance = float(freebet_daily["total_freebet_balance_end"].iloc[-1])
-
-    # Стоимость программы по фактически потраченным AOR-фрибетам.
-    program_cost_spent = aor_freebets_spent_total * COIN_COST_EUR
-
-    # Консервативный взгляд: считаем весь выданный объём Coins / фрибетов как обязательство периода.
-    program_cost_issued = freebets_issued_total * COIN_COST_EUR
-
-    incremental_ggr_net_after_spent = incremental_ggr_gross - program_cost_spent
-    incremental_ggr_net_conservative = incremental_ggr_gross - program_cost_issued
-
-    roi_after_spent = safe_divide(incremental_ggr_net_after_spent, program_cost_spent, default=np.nan)
-    roi_conservative = safe_divide(incremental_ggr_net_conservative, program_cost_issued, default=np.nan)
-
-    gross_uplift_pct = safe_divide(incremental_ggr_gross, baseline_ggr, default=np.nan)
-    net_uplift_pct_after_spent = safe_divide(incremental_ggr_net_after_spent, baseline_ggr, default=np.nan)
-    net_uplift_pct_conservative = safe_divide(incremental_ggr_net_conservative, baseline_ggr, default=np.nan)
-
-    baseline_daily_bets = baseline_bets * daily_weights
-    aor_daily_bets = aor_bets * daily_weights
-
-    baseline_daily_turnover = baseline_turnover * daily_weights
-    aor_daily_turnover = aor_turnover * daily_weights
-
-    baseline_daily_ggr = baseline_ggr * daily_weights
-    aor_daily_ggr = aor_ggr_gross * daily_weights
-
-    daily = pd.DataFrame(
-        {
+        rows.append({
             "simulation": sim_id,
-            "day": np.arange(1, DAYS + 1),
-            "baseline_bets": baseline_daily_bets,
-            "aor_bets": aor_daily_bets,
-            "baseline_turnover": baseline_daily_turnover,
-            "aor_turnover": aor_daily_turnover,
-            "baseline_ggr": baseline_daily_ggr,
-            "aor_ggr_gross": aor_daily_ggr,
-            "completed_missions": daily_completed_missions,
-        }
-    )
-    daily["incremental_ggr_gross"] = daily["aor_ggr_gross"] - daily["baseline_ggr"]
+            "iteration": i,
+            "iteration_weight": w,
+            "targeted_users": targeted,
+            "activated_users": activated,
+            "completed_users": completed,
+            "completed_missions": missions,
+            "avg_missions_per_completed_user": avg_missions_actual,
+            "baseline_bets": base_bets,
+            "aor_bets": aor_bets,
+            "incremental_bets": aor_bets - base_bets,
+            "baseline_turnover": base_turnover,
+            "aor_turnover": aor_turnover,
+            "incremental_turnover": aor_turnover - base_turnover,
+            "baseline_ggr": base_ggr,
+            "aor_ggr_gross": aor_ggr_gross,
+            "incremental_ggr_gross": inc_ggr,
+            "max_reward_budget": max_reward_budget,
+            "planned_reward_budget": planned_reward_budget,
+            "coins_issued": coins_issued,
+            "coins_per_completed_mission": safe_divide(coins_issued, missions),
+            "freebets_issued": freebets_issued,
+            "freebets_spent": freebets_spent,
+            "freebet_balance_start": balance_start,
+            "freebet_balance_after_issue": balance_after_issue,
+            "freebet_balance_end": balance_end,
+            "program_cost_spent": cost_spent,
+            "program_cost_issued": cost_issued,
+            "net_ggr_after_spent": net_after_spent,
+            "conservative_net_ggr": conservative_net,
+            "reward_limit_ok": cost_issued <= max(0.0, inc_ggr),
+            "break_even_after_spent": net_after_spent >= 0,
+            "break_even_conservative": conservative_net >= 0,
+        })
 
-    daily = daily.merge(freebet_daily, on="day", how="left")
-    daily["aor_freebet_cost_spent"] = daily["aor_freebets_spent"] * COIN_COST_EUR
-    daily["initial_freebet_cost_spent"] = daily["initial_freebets_spent"] * COIN_COST_EUR
-    daily["net_incremental_ggr_after_spent_aor_freebets"] = (
-        daily["incremental_ggr_gross"] - daily["aor_freebet_cost_spent"]
-    )
+    iter_df = pd.DataFrame(rows)
+    baseline_ggr = float(iter_df["baseline_ggr"].sum())
+    inc_ggr_total = float(iter_df["incremental_ggr_gross"].sum())
+    cost_spent_total = float(iter_df["program_cost_spent"].sum())
+    cost_issued_total = float(iter_df["program_cost_issued"].sum())
+    missions_total = float(iter_df["completed_missions"].sum())
+    completed_total = float(iter_df["completed_users"].sum())
+    freebets_issued_total = float(iter_df["freebets_issued"].sum())
+    freebets_spent_total = float(iter_df["freebets_spent"].sum())
+    final_balance = float(iter_df["freebet_balance_end"].iloc[-1])
 
-    metrics = {
+    sim = {
         "simulation": sim_id,
-
-        "targeted_users": targeted_users,
-        "activated_users": activated_users,
-        "completed_users": completed_users,
-
-        "completed_missions_total": completed_missions_total,
-        "actual_avg_missions_per_completed_user": actual_avg_missions,
-
-        "baseline_bets": baseline_bets,
-        "aor_bets": aor_bets,
-        "incremental_bets": aor_bets - baseline_bets,
-
-        "baseline_turnover": baseline_turnover,
-        "aor_turnover": aor_turnover,
-        "incremental_turnover": aor_turnover - baseline_turnover,
-
+        "completed_users_total": completed_total,
+        "completed_missions_total": missions_total,
+        "avg_missions_per_completed_user": safe_divide(missions_total, completed_total),
+        "baseline_bets": float(iter_df["baseline_bets"].sum()),
+        "aor_bets": float(iter_df["aor_bets"].sum()),
+        "incremental_bets": float(iter_df["incremental_bets"].sum()),
+        "baseline_turnover": float(iter_df["baseline_turnover"].sum()),
+        "aor_turnover": float(iter_df["aor_turnover"].sum()),
+        "incremental_turnover": float(iter_df["incremental_turnover"].sum()),
         "baseline_ggr": baseline_ggr,
-        "aor_ggr_gross": aor_ggr_gross,
-        "incremental_ggr_gross": incremental_ggr_gross,
-        "gross_uplift_pct": gross_uplift_pct,
-
-        "max_reward_budget": max_reward_budget,
-        "planned_reward_budget": planned_reward_budget,
-
-        "max_coins_total": max_coins_total,
-        "coins_total": coins_total,
-        "coins_per_completed_mission": coins_per_completed_mission,
-        "coins_per_active_user": safe_divide(coins_total, inputs.active_users),
-        "max_coins_per_active_user": safe_divide(max_coins_total, inputs.active_users),
-
-        "aor_freebets_issued_total": freebets_issued_total,
-        "aor_freebets_spent_total": aor_freebets_spent_total,
-        "aor_freebets_end_balance": aor_freebets_end_balance,
-
-        "aor_freebets_issued_per_active_user": safe_divide(freebets_issued_total, inputs.active_users),
-        "aor_freebets_spent_per_active_user": safe_divide(aor_freebets_spent_total, inputs.active_users),
-        "aor_freebets_end_balance_per_active_user": safe_divide(aor_freebets_end_balance, inputs.active_users),
-
-        "freebets_per_completed_mission": freebets_per_completed_mission,
-
-        "initial_freebets_start_total": initial_freebets_total,
-        "initial_freebets_spent_total": initial_freebets_spent_total,
-        "initial_freebets_end_balance": initial_freebets_end_balance,
-
-        "total_freebets_spent": total_freebets_spent,
-        "total_freebets_end_balance": total_freebets_end_balance,
-
-        "program_cost_spent": program_cost_spent,
-        "program_cost_issued": program_cost_issued,
-
-        "incremental_ggr_net_after_spent": incremental_ggr_net_after_spent,
-        "incremental_ggr_net_conservative": incremental_ggr_net_conservative,
-
-        "roi_after_spent": roi_after_spent,
-        "roi_conservative": roi_conservative,
-
-        "net_uplift_pct_after_spent": net_uplift_pct_after_spent,
-        "net_uplift_pct_conservative": net_uplift_pct_conservative,
-
-        "reward_budget_does_not_exceed_incremental_profit": program_cost_issued <= max(0.0, incremental_ggr_gross),
-        "break_even_after_spent_rewards": incremental_ggr_net_after_spent >= 0,
-        "break_even_conservative": incremental_ggr_net_conservative >= 0,
+        "aor_ggr_gross": float(iter_df["aor_ggr_gross"].sum()),
+        "incremental_ggr_gross": inc_ggr_total,
+        "gross_uplift_pct": safe_divide(inc_ggr_total, baseline_ggr, default=np.nan),
+        "max_reward_budget_total": float(iter_df["max_reward_budget"].sum()),
+        "planned_reward_budget_total": float(iter_df["planned_reward_budget"].sum()),
+        "coins_issued_total": freebets_issued_total,
+        "coins_issued_per_active_user": safe_divide(freebets_issued_total, inp.active_users),
+        "coins_per_completed_mission": safe_divide(freebets_issued_total, missions_total),
+        "freebets_issued_total": freebets_issued_total,
+        "freebets_spent_total": freebets_spent_total,
+        "final_freebet_balance": final_balance,
+        "freebets_issued_per_active_user": safe_divide(freebets_issued_total, inp.active_users),
+        "freebets_spent_per_active_user": safe_divide(freebets_spent_total, inp.active_users),
+        "final_freebet_balance_per_active_user": safe_divide(final_balance, inp.active_users),
+        "program_cost_spent": cost_spent_total,
+        "program_cost_issued": cost_issued_total,
+        "net_ggr_after_spent": inc_ggr_total - cost_spent_total,
+        "conservative_net_ggr": inc_ggr_total - cost_issued_total,
+        "roi_after_spent": safe_divide(inc_ggr_total - cost_spent_total, cost_spent_total, default=np.nan),
+        "roi_conservative": safe_divide(inc_ggr_total - cost_issued_total, cost_issued_total, default=np.nan),
+        "net_uplift_pct_after_spent": safe_divide(inc_ggr_total - cost_spent_total, baseline_ggr, default=np.nan),
+        "net_uplift_pct_conservative": safe_divide(inc_ggr_total - cost_issued_total, baseline_ggr, default=np.nan),
+        "reward_limit_compliance_share": float(iter_df["reward_limit_ok"].mean()),
+        "break_even_after_spent_share": float(iter_df["break_even_after_spent"].mean()),
+        "break_even_conservative_share": float(iter_df["break_even_conservative"].mean()),
     }
-
-    return metrics, daily
+    return sim, iter_df
 
 
 @st.cache_data(show_spinner=False)
-def run_simulations(inputs_dict: Dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    inputs = ModelInputs(**inputs_dict)
-    rng = np.random.default_rng(inputs.random_seed)
-
-    metric_rows = []
-    daily_frames = []
-
-    for sim_id in range(1, inputs.n_simulations + 1):
-        row, daily = run_single_simulation(rng, inputs, sim_id)
-        metric_rows.append(row)
-        daily_frames.append(daily)
-
-    return pd.DataFrame(metric_rows), pd.concat(daily_frames, ignore_index=True)
+def run_simulations(inp_dict: Dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    inp = ModelInputs(**inp_dict)
+    rng = np.random.default_rng(inp.random_seed)
+    sim_rows, iter_frames = [], []
+    for sim_id in range(1, inp.n_simulations + 1):
+        sim, iters = run_single_simulation(rng, inp, sim_id)
+        sim_rows.append(sim)
+        iter_frames.append(iters)
+    return pd.DataFrame(sim_rows), pd.concat(iter_frames, ignore_index=True)
 
 
-def build_summary(metrics_df: pd.DataFrame) -> pd.DataFrame:
-    metric_order = [
-        "completed_users",
-        "completed_missions_total",
-        "actual_avg_missions_per_completed_user",
-
-        "incremental_bets",
-        "incremental_turnover",
-        "incremental_ggr_gross",
-        "gross_uplift_pct",
-
-        "max_reward_budget",
-        "planned_reward_budget",
-
-        "max_coins_total",
-        "coins_total",
-        "coins_per_completed_mission",
-        "coins_per_active_user",
-        "max_coins_per_active_user",
-
-        "aor_freebets_issued_total",
-        "aor_freebets_spent_total",
-        "aor_freebets_end_balance",
-        "aor_freebets_issued_per_active_user",
-        "aor_freebets_spent_per_active_user",
-        "aor_freebets_end_balance_per_active_user",
-
-        "initial_freebets_start_total",
-        "initial_freebets_spent_total",
-        "initial_freebets_end_balance",
-
-        "program_cost_spent",
-        "program_cost_issued",
-
-        "incremental_ggr_net_after_spent",
-        "incremental_ggr_net_conservative",
-
-        "roi_after_spent",
-        "roi_conservative",
-
-        "net_uplift_pct_after_spent",
-        "net_uplift_pct_conservative",
+def build_summary(df):
+    order = [
+        "completed_users_total", "completed_missions_total", "avg_missions_per_completed_user",
+        "incremental_bets", "incremental_turnover", "incremental_ggr_gross", "gross_uplift_pct",
+        "max_reward_budget_total", "planned_reward_budget_total",
+        "coins_issued_total", "coins_issued_per_active_user", "coins_per_completed_mission",
+        "freebets_issued_total", "freebets_spent_total", "final_freebet_balance",
+        "freebets_issued_per_active_user", "freebets_spent_per_active_user", "final_freebet_balance_per_active_user",
+        "program_cost_spent", "program_cost_issued", "net_ggr_after_spent", "conservative_net_ggr",
+        "roi_after_spent", "roi_conservative", "net_uplift_pct_after_spent", "net_uplift_pct_conservative",
     ]
-
     rows = []
-    for metric in metric_order:
-        s = metrics_df[metric].replace([np.inf, -np.inf], np.nan).dropna()
-        rows.append(
-            {
-                "metric": metric,
-                "p05": s.quantile(0.05),
-                "mean": s.mean(),
-                "median": s.median(),
-                "p95": s.quantile(0.95),
-            }
-        )
-
+    for m in order:
+        s = df[m].replace([np.inf, -np.inf], np.nan).dropna()
+        rows.append({"metric": m, "p05": s.quantile(0.05), "mean": s.mean(), "median": s.median(), "p95": s.quantile(0.95)})
     return pd.DataFrame(rows)
 
 
-def format_summary(summary_df: pd.DataFrame) -> pd.DataFrame:
+def format_summary(summary):
     names = {
-        "completed_users": "Пользователи, выполнившие хотя бы 1 миссию",
+        "completed_users_total": "Completed users суммарно по итерациям",
         "completed_missions_total": "Выполненные миссии всего",
-        "actual_avg_missions_per_completed_user": "Миссий на completed user",
-
+        "avg_missions_per_completed_user": "Миссий на completed user",
         "incremental_bets": "Дополнительные ставки",
         "incremental_turnover": "Дополнительный оборот",
         "incremental_ggr_gross": "Изменение GGR / дополнительный gross GGR",
         "gross_uplift_pct": "Изменение GGR, % к baseline",
-
-        "max_reward_budget": "Максимальный фонд Coins / фрибетов",
-        "planned_reward_budget": "Плановый фонд Coins / фрибетов",
-
-        "max_coins_total": "Максимум Coins всего",
-        "coins_total": "Расчётные Coins всего",
+        "max_reward_budget_total": "Максимальный фонд Coins / фрибетов",
+        "planned_reward_budget_total": "Плановый фонд Coins / фрибетов",
+        "coins_issued_total": "Выдано Coins всего",
+        "coins_issued_per_active_user": "Coins на active user",
         "coins_per_completed_mission": "Coins на выполненную миссию",
-        "coins_per_active_user": "Coins на active user",
-        "max_coins_per_active_user": "Максимум Coins на active user",
-
-        "aor_freebets_issued_total": "AOR-фрибеты выданы всего",
-        "aor_freebets_spent_total": "AOR-фрибеты использованы всего",
-        "aor_freebets_end_balance": "AOR-фрибеты на конец периода",
-        "aor_freebets_issued_per_active_user": "AOR-фрибеты выданы на active user",
-        "aor_freebets_spent_per_active_user": "AOR-фрибеты использованы на active user",
-        "aor_freebets_end_balance_per_active_user": "AOR-фрибеты на конец на active user",
-
-        "initial_freebets_start_total": "Стартовые фрибеты на начало",
-        "initial_freebets_spent_total": "Стартовые фрибеты использованы",
-        "initial_freebets_end_balance": "Стартовые фрибеты на конец",
-
-        "program_cost_spent": "Стоимость использованных AOR-фрибетов",
-        "program_cost_issued": "Консервативная стоимость выданных AOR-фрибетов",
-
-        "incremental_ggr_net_after_spent": "Net GGR после использованных AOR-фрибетов",
-        "incremental_ggr_net_conservative": "Консервативный Net GGR после выданных AOR-фрибетов",
-
-        "roi_after_spent": "ROI по использованным AOR-фрибетам",
-        "roi_conservative": "Консервативный ROI по выданным AOR-фрибетам",
-
-        "net_uplift_pct_after_spent": "Net uplift после использованных AOR-фрибетов",
-        "net_uplift_pct_conservative": "Консервативный net uplift после выданных AOR-фрибетов",
+        "freebets_issued_total": "Фрибеты выданы всего",
+        "freebets_spent_total": "Фрибеты использованы всего",
+        "final_freebet_balance": "Фрибеты на конец симуляции",
+        "freebets_issued_per_active_user": "Фрибеты выданы на active user",
+        "freebets_spent_per_active_user": "Фрибеты использованы на active user",
+        "final_freebet_balance_per_active_user": "Остаток фрибетов на active user",
+        "program_cost_spent": "Стоимость использованных фрибетов",
+        "program_cost_issued": "Консервативная стоимость выданных фрибетов",
+        "net_ggr_after_spent": "Net GGR после использованных фрибетов",
+        "conservative_net_ggr": "Консервативный Net GGR после выданных фрибетов",
+        "roi_after_spent": "ROI по использованным фрибетам",
+        "roi_conservative": "Консервативный ROI по выданным фрибетам",
+        "net_uplift_pct_after_spent": "Net uplift после использованных фрибетов",
+        "net_uplift_pct_conservative": "Консервативный net uplift после выданных фрибетов",
     }
-
-    money_metrics = {
-        "incremental_turnover",
-        "incremental_ggr_gross",
-        "max_reward_budget",
-        "planned_reward_budget",
-        "program_cost_spent",
-        "program_cost_issued",
-        "incremental_ggr_net_after_spent",
-        "incremental_ggr_net_conservative",
-    }
-    pct_metrics = {
-        "gross_uplift_pct",
-        "roi_after_spent",
-        "roi_conservative",
-        "net_uplift_pct_after_spent",
-        "net_uplift_pct_conservative",
-    }
-
-    formatted = summary_df.copy()
-    formatted["source_metric"] = formatted["metric"]
-    formatted["metric"] = formatted["metric"].map(names).fillna(formatted["metric"])
-
+    money = {"incremental_turnover", "incremental_ggr_gross", "max_reward_budget_total", "planned_reward_budget_total", "program_cost_spent", "program_cost_issued", "net_ggr_after_spent", "conservative_net_ggr"}
+    perc = {"gross_uplift_pct", "roi_after_spent", "roi_conservative", "net_uplift_pct_after_spent", "net_uplift_pct_conservative"}
+    out = summary.copy()
+    out["source_metric"] = out["metric"]
+    out["metric"] = out["metric"].map(names).fillna(out["metric"])
     for col in ["p05", "mean", "median", "p95"]:
-        formatted[col] = formatted[col].astype("object")
-
-    for idx, row in formatted.iterrows():
-        metric = row["source_metric"]
+        out[col] = out[col].astype("object")
+    for idx, row in out.iterrows():
+        m = row["source_metric"]
         for col in ["p05", "mean", "median", "p95"]:
-            value = row[col]
-            if metric in money_metrics:
-                formatted.at[idx, col] = eur(value)
-            elif metric in pct_metrics:
-                formatted.at[idx, col] = pct(value)
-            else:
-                formatted.at[idx, col] = number(value)
-
-    return formatted.drop(columns=["source_metric"])
+            val = row[col]
+            out.at[idx, col] = eur(val) if m in money else pct(val) if m in perc else number(val)
+    return out.drop(columns=["source_metric"])
 
 
 def main():
-    st.set_page_config(
-        page_title="AOR — Coins, фрибеты и миссии",
-        page_icon="📈",
-        layout="wide",
-    )
-
-    st.title("Art of Retention — симуляционная модель с миссиями, Coins и фрибетами")
-    st.caption(
-        "Модель учитывает стартовые фрибеты, траты фрибетов в течение 30 дней "
-        "и возможность выполнить больше одной миссии на пользователя в месяц."
-    )
+    st.set_page_config(page_title="AOR — итерационная модель", page_icon="📈", layout="wide")
+    st.title("Art of Retention — итерационная модель Coins и фрибетов")
+    st.caption("На старте у пользователей 0 фрибетов. В каждой итерации они могут выполнить миссии, получить Coins / фрибеты, использовать часть баланса и перенести остаток дальше.")
 
     with st.sidebar:
         st.header("1. Базовые данные букмекера")
-        total_bets = st.number_input(
-            "Количество ставок за период",
-            min_value=1,
-            value=5_483_458,
-            step=1_000,
-        )
-        turnover = st.number_input(
-            "Оборот, €",
-            min_value=1.0,
-            value=40_834_160.0,
-            step=10_000.0,
-        )
-        ggr = st.number_input(
-            "GGR, €",
-            value=4_682_582.0,
-            step=5_000.0,
-        )
-        active_users = st.number_input(
-            "Активные пользователи за период",
-            min_value=1,
-            value=372_326,
-            step=100,
-            help="Нужно для распределения ставок между пользователями.",
-        )
+        total_bets = st.number_input("Количество ставок за период", min_value=1, value=5_483_458, step=1_000)
+        turnover = st.number_input("Оборот, €", min_value=1.0, value=40_834_160.0, step=10_000.0)
+        ggr = st.number_input("GGR, €", value=4_682_582.0, step=5_000.0)
+        active_users = st.number_input("Активные пользователи за период", min_value=1, value=372_326, step=100)
 
-        st.header("2. Воронка AOR")
+        st.header("2. Итерации")
+        n_iterations = st.slider("Количество итераций в периоде", 1, 30, 6, 1)
+        iteration_volatility = st.slider("Волатильность активности между итерациями", 0.00, 1.00, 0.15, 0.01)
+
+        st.header("3. Воронка AOR на каждой итерации")
         target_share = st.slider("Доля пользователей, выбранных системой", 0.0, 1.0, 0.30, 0.01)
         activation_rate = st.slider("Доля пользователей, принявших миссию", 0.0, 1.0, 0.50, 0.01)
         completion_rate = st.slider("Доля пользователей, выполнивших хотя бы 1 миссию", 0.0, 1.0, 0.60, 0.01)
 
-        st.header("3. Миссии")
-        avg_missions_per_completed_user = st.slider(
-            "Среднее количество миссий на completed user в месяц",
-            1.0,
-            10.0,
-            2.0,
-            0.1,
-            help="Пользователь, который выполнил миссию, может выполнить больше одной миссии за 30 дней.",
-        )
-        max_missions_per_completed_user = st.slider(
-            "Максимум миссий на completed user в месяц",
-            1,
-            20,
-            5,
-            1,
-        )
+        st.header("4. Миссии на каждой итерации")
+        avg_missions = st.slider("Среднее миссий на completed user за итерацию", 1.0, 10.0, 2.0, 0.1)
+        max_missions = st.slider("Максимум миссий на completed user за итерацию", 1, 20, 5, 1)
 
-        st.header("4. Характеристики роста")
-        bet_count_uplift = st.slider("Рост количества ставок у выполнивших миссию", -0.50, 2.00, 0.15, 0.01)
-        avg_stake_uplift = st.slider("Рост средней ставки у выполнивших миссию", -0.50, 2.00, 0.05, 0.01)
-        hold_uplift = st.slider("Изменение hold / GGR margin у выполнивших миссию", -0.50, 1.00, 0.00, 0.01)
+        st.header("5. Характеристики роста")
+        bet_count_uplift = st.slider("Рост количества ставок у completed users", -0.50, 2.00, 0.15, 0.01)
+        avg_stake_uplift = st.slider("Рост средней ставки у completed users", -0.50, 2.00, 0.05, 0.01)
+        hold_uplift = st.slider("Изменение hold / GGR margin у completed users", -0.50, 1.00, 0.00, 0.01)
 
-        st.header("5. Расчёт Coins")
-        reward_budget_share = st.slider(
-            "Доля дополнительной прибыли на Coins / фрибеты",
-            0.0,
-            1.0,
-            0.50,
-            0.01,
-            help=(
-                "Например, 50% означает, что на Coins можно направить половину дополнительного gross GGR. "
-                "Даже при 100% фонд не превысит дополнительную прибыль."
-            ),
-        )
-        st.info("Фиксировано в этой версии: 1 Coin = 1 фрибет = €1 бонусного бюджета.")
-
-        st.header("6. Стартовые фрибеты и траты")
-        initial_freebets_per_active_user = st.number_input(
-            "Стартовые фрибеты на active user",
-            min_value=0.0,
-            value=0.0,
-            step=0.1,
-            help="Фрибеты, которые уже есть у пользователей в начале симуляции. Это не AOR-выдача, а стартовый баланс.",
-        )
-        daily_freebet_spend_rate = st.slider(
-            "Доля доступных фрибетов, используемых в день",
-            0.0,
-            1.0,
-            0.05,
-            0.01,
-            help="Применяется отдельно к стартовому балансу и к AOR-фрибетам, которые появляются в течение симуляции.",
-        )
+        st.header("6. Coins и траты фрибетов")
+        reward_budget_share = st.slider("Доля дополнительной прибыли на Coins / фрибеты", 0.0, 1.0, 0.50, 0.01)
+        spend_rate = st.slider("Доля доступных фрибетов, используемых за итерацию", 0.0, 1.0, 0.50, 0.01)
+        st.info("Фиксировано: 1 Coin = 1 фрибет = €1 бонусного бюджета. На старте баланс фрибетов = 0.")
 
         st.header("7. Настройки симуляции")
-        n_simulations = st.number_input(
-            "Количество симуляций",
-            min_value=200,
-            value=300,
-            step=50,
-        )
-        user_bet_cv = st.slider(
-            "Коэффициент вариации ставок пользователей",
-            0.01,
-            3.00,
-            0.80,
-            0.01,
-            help="Чем выше значение, тем сильнее различается активность пользователей.",
-        )
-        daily_volatility = st.slider("Дневная волатильность активности", 0.00, 1.00, 0.15, 0.01)
+        n_simulations = st.number_input("Количество симуляций", min_value=200, value=300, step=50)
+        user_bet_cv = st.slider("Коэффициент вариации ставок пользователей", 0.01, 3.00, 0.80, 0.01)
         random_seed = st.number_input("Random seed", value=42, step=1)
 
-    base_avg_stake = safe_divide(turnover, total_bets)
-    base_hold = safe_divide(ggr, turnover)
-    base_ggr_per_bet = safe_divide(ggr, total_bets)
+    avg_stake_base = safe_divide(turnover, total_bets)
+    hold_base = safe_divide(ggr, turnover)
+    ggr_per_bet = safe_divide(ggr, total_bets)
     bets_per_user = safe_divide(total_bets, active_users)
 
     st.subheader("Базовая экономика")
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Средняя ставка", eur(base_avg_stake))
-    b2.metric("GGR margin / hold", pct(base_hold))
-    b3.metric("GGR на одну ставку", eur(base_ggr_per_bet))
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("Средняя ставка", eur(avg_stake_base))
+    b2.metric("GGR margin / hold", pct(hold_base))
+    b3.metric("GGR на ставку", eur(ggr_per_bet))
     b4.metric("Ставок на active user", number(bets_per_user))
+    b5.metric("Итераций", str(n_iterations))
 
-    inputs = ModelInputs(
-        total_bets=int(total_bets),
-        turnover=float(turnover),
-        ggr=float(ggr),
-        active_users=int(active_users),
-        n_simulations=int(n_simulations),
-
-        target_share=float(target_share),
-        activation_rate=float(activation_rate),
-        completion_rate=float(completion_rate),
-
-        avg_missions_per_completed_user=float(avg_missions_per_completed_user),
-        max_missions_per_completed_user=int(max_missions_per_completed_user),
-
-        bet_count_uplift=float(bet_count_uplift),
-        avg_stake_uplift=float(avg_stake_uplift),
-        hold_uplift=float(hold_uplift),
-
-        reward_budget_share=float(reward_budget_share),
-
-        initial_freebets_per_active_user=float(initial_freebets_per_active_user),
-        daily_freebet_spend_rate=float(daily_freebet_spend_rate),
-
-        user_bet_cv=float(user_bet_cv),
-        daily_volatility=float(daily_volatility),
-        random_seed=int(random_seed),
+    inp = ModelInputs(
+        total_bets=int(total_bets), turnover=float(turnover), ggr=float(ggr), active_users=int(active_users),
+        n_simulations=int(n_simulations), n_iterations=int(n_iterations), target_share=float(target_share),
+        activation_rate=float(activation_rate), completion_rate=float(completion_rate),
+        avg_missions_per_completed_user_per_iteration=float(avg_missions),
+        max_missions_per_completed_user_per_iteration=int(max_missions),
+        bet_count_uplift=float(bet_count_uplift), avg_stake_uplift=float(avg_stake_uplift), hold_uplift=float(hold_uplift),
+        reward_budget_share=float(reward_budget_share), freebet_spend_rate_per_iteration=float(spend_rate),
+        user_bet_cv=float(user_bet_cv), iteration_volatility=float(iteration_volatility), random_seed=int(random_seed),
     )
-
-    metrics_df, daily_df = run_simulations(inputs.__dict__)
+    metrics_df, iteration_df = run_simulations(inp.__dict__)
 
     st.subheader("Результаты симуляции")
-
-    avg_freebets_issued = metrics_df["aor_freebets_issued_per_active_user"].mean()
-    avg_freebets_spent = metrics_df["aor_freebets_spent_per_active_user"].mean()
-    avg_max_coins = metrics_df["max_coins_per_active_user"].mean()
-    avg_missions_actual = metrics_df["actual_avg_missions_per_completed_user"].mean()
-
+    mean_freebets_issued = metrics_df["freebets_issued_per_active_user"].mean()
+    mean_freebets_spent = metrics_df["freebets_spent_per_active_user"].mean()
+    mean_final_balance = metrics_df["final_freebet_balance_per_active_user"].mean()
+    mean_missions = metrics_df["avg_missions_per_completed_user"].mean()
     mean_ggr_change = metrics_df["incremental_ggr_gross"].mean()
     median_ggr_change_pct = metrics_df["gross_uplift_pct"].median()
-
-    mean_aor_spent_cost = metrics_df["program_cost_spent"].mean()
-    mean_net_after_spent = metrics_df["incremental_ggr_net_after_spent"].mean()
+    mean_spent_cost = metrics_df["program_cost_spent"].mean()
+    mean_net_after_spent = metrics_df["net_ggr_after_spent"].mean()
     median_roi_after_spent = metrics_df["roi_after_spent"].median()
-
-    mean_conservative_net = metrics_df["incremental_ggr_net_conservative"].mean()
-    mean_initial_spent = metrics_df["initial_freebets_spent_total"].mean()
-    mean_end_balance = metrics_df["total_freebets_end_balance"].mean()
-    constraint_share = metrics_df["reward_budget_does_not_exceed_incremental_profit"].mean()
+    mean_conservative_net = metrics_df["conservative_net_ggr"].mean()
+    limit_share = metrics_df["reward_limit_compliance_share"].mean()
+    break_even_after_spent = metrics_df["break_even_after_spent_share"].mean()
 
     r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    r1c1.metric("AOR-фрибеты выданы / active user", number(avg_freebets_issued))
-    r1c2.metric("AOR-фрибеты использованы / active user", number(avg_freebets_spent))
-    r1c3.metric("Макс. Coins / active user", number(avg_max_coins))
-    r1c4.metric("Миссий на completed user", number(avg_missions_actual))
+    r1c1.metric("Фрибеты выданы / active user", number(mean_freebets_issued))
+    r1c2.metric("Фрибеты использованы / active user", number(mean_freebets_spent))
+    r1c3.metric("Фрибеты на конец / active user", number(mean_final_balance))
+    r1c4.metric("Миссий на completed user", number(mean_missions))
 
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     r2c1.metric("Изменение GGR", eur(mean_ggr_change), delta=pct(median_ggr_change_pct))
-    r2c2.metric("Стоимость использованных AOR-фрибетов", eur(mean_aor_spent_cost))
+    r2c2.metric("Стоимость использованных фрибетов", eur(mean_spent_cost))
     r2c3.metric("Net GGR после трат", eur(mean_net_after_spent))
     r2c4.metric("ROI после трат", pct(median_roi_after_spent))
 
-    r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+    r3c1, r3c2, r3c3 = st.columns(3)
     r3c1.metric("Консервативный net GGR", eur(mean_conservative_net))
-    r3c2.metric("Стартовые фрибеты использованы", eur(mean_initial_spent))
-    r3c3.metric("Баланс фрибетов на конец", number(mean_end_balance))
-    r3c4.metric("Лимит Coins соблюдён", pct(constraint_share))
+    r3c2.metric("Лимит Coins соблюдён", pct(limit_share))
+    r3c3.metric("Break-even итерации после трат", pct(break_even_after_spent))
 
-    st.markdown(
-        """
-        **Что добавлено в этой версии.**
+    st.markdown("""
+**Итерационная логика.** На старте `Freebet Balance = 0`. В каждой итерации модель считает incremental gross GGR, выдаёт Coins / фрибеты в пределах созданной дополнительной прибыли, добавляет их к балансу, списывает использованную часть и переносит остаток в следующую итерацию.
 
-        1. У пользователей может быть больше одной миссии в месяц.  
-        Количество миссий моделируется на completed user, а затем распределяется по 30 дням.
+```text
+Coins / Freebets Issued Cost <= Incremental Gross GGR of Iteration
+```
+""")
 
-        2. У пользователей может быть стартовый баланс фрибетов на начало симуляции.  
-        Эти фрибеты учитываются отдельно от AOR-фрибетов.
-
-        3. Пользователи могут тратить фрибеты в течение симуляции.  
-        Каждый день модель списывает заданную долю доступного баланса: отдельно по стартовым фрибетам и отдельно по AOR-фрибетам.
-
-        4. AOR Coins и AOR-фрибеты по-прежнему не вводятся вручную.  
-        Они рассчитываются из дополнительного gross GGR:
-
-        ```text
-        Max Reward Budget = max(0, Incremental Gross GGR)
-        Planned Reward Budget = Max Reward Budget × Reward Budget Share
-        Coins = floor(Planned Reward Budget / €1)
-        AOR Freebets Issued = Coins
-        ```
-
-        Стоимость выданных AOR Coins / фрибетов не может превышать дополнительную прибыль от программы.
-        """
-    )
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        [
-            "Динамика за 30 дней",
-            "Фрибеты по дням",
-            "Распределения",
-            "Сводная таблица",
-            "Данные симуляций",
-        ]
-    )
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Итерации", "Фрибеты", "Распределения", "Сводная таблица", "Данные"])
 
     with tab1:
-        daily_summary = (
-            daily_df.groupby("day")
-            .agg(
-                baseline_ggr_median=("baseline_ggr", "median"),
-                aor_ggr_median=("aor_ggr_gross", "median"),
-                net_ggr_after_spent_median=("net_incremental_ggr_after_spent_aor_freebets", "median"),
-                baseline_bets_median=("baseline_bets", "median"),
-                aor_bets_median=("aor_bets", "median"),
-            )
-            .reset_index()
-        )
-
+        iter_summary = iteration_df.groupby("iteration").agg(
+            baseline_ggr=("baseline_ggr", "median"),
+            aor_ggr_gross=("aor_ggr_gross", "median"),
+            net_ggr_after_spent=("net_ggr_after_spent", "median"),
+            completed_missions=("completed_missions", "median"),
+        ).reset_index()
         fig_ggr = go.Figure()
-        fig_ggr.add_trace(
-            go.Scatter(
-                x=daily_summary["day"],
-                y=daily_summary["baseline_ggr_median"],
-                mode="lines",
-                name="Baseline GGR",
-            )
-        )
-        fig_ggr.add_trace(
-            go.Scatter(
-                x=daily_summary["day"],
-                y=daily_summary["aor_ggr_median"],
-                mode="lines",
-                name="AOR gross GGR",
-            )
-        )
-        fig_ggr.update_layout(
-            title="Медианный дневной GGR: baseline vs AOR",
-            xaxis_title="День",
-            yaxis_title="GGR, €",
-            hovermode="x unified",
-        )
+        fig_ggr.add_trace(go.Scatter(x=iter_summary["iteration"], y=iter_summary["baseline_ggr"], mode="lines+markers", name="Baseline GGR"))
+        fig_ggr.add_trace(go.Scatter(x=iter_summary["iteration"], y=iter_summary["aor_ggr_gross"], mode="lines+markers", name="AOR gross GGR"))
+        fig_ggr.add_trace(go.Scatter(x=iter_summary["iteration"], y=iter_summary["net_ggr_after_spent"], mode="lines+markers", name="Net GGR after spent freebets"))
+        fig_ggr.update_layout(title="Медианный GGR по итерациям", xaxis_title="Итерация", yaxis_title="GGR, €", hovermode="x unified")
         st.plotly_chart(fig_ggr, use_container_width=True)
-
-        fig_bets = go.Figure()
-        fig_bets.add_trace(
-            go.Scatter(
-                x=daily_summary["day"],
-                y=daily_summary["baseline_bets_median"],
-                mode="lines",
-                name="Baseline ставки",
-            )
-        )
-        fig_bets.add_trace(
-            go.Scatter(
-                x=daily_summary["day"],
-                y=daily_summary["aor_bets_median"],
-                mode="lines",
-                name="AOR ставки",
-            )
-        )
-        fig_bets.update_layout(
-            title="Медианное количество ставок по дням: baseline vs AOR",
-            xaxis_title="День",
-            yaxis_title="Ставки",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_bets, use_container_width=True)
+        fig_missions = px.bar(iter_summary, x="iteration", y="completed_missions", title="Медианное количество выполненных миссий по итерациям")
+        fig_missions.update_layout(xaxis_title="Итерация", yaxis_title="Миссии")
+        st.plotly_chart(fig_missions, use_container_width=True)
 
     with tab2:
-        freebet_daily_summary = (
-            daily_df.groupby("day")
-            .agg(
-                aor_issued=("aor_freebets_issued", "median"),
-                aor_spent=("aor_freebets_spent", "median"),
-                initial_spent=("initial_freebets_spent", "median"),
-                aor_balance=("aor_freebet_balance_end", "median"),
-                initial_balance=("initial_freebet_balance_end", "median"),
-                total_balance=("total_freebet_balance_end", "median"),
-                completed_missions=("completed_missions", "median"),
-            )
-            .reset_index()
-        )
-
-        fig_fb_flow = go.Figure()
-        fig_fb_flow.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["aor_issued"],
-                mode="lines",
-                name="AOR-фрибеты выданы",
-            )
-        )
-        fig_fb_flow.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["aor_spent"],
-                mode="lines",
-                name="AOR-фрибеты использованы",
-            )
-        )
-        fig_fb_flow.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["initial_spent"],
-                mode="lines",
-                name="Стартовые фрибеты использованы",
-            )
-        )
-        fig_fb_flow.update_layout(
-            title="Медианный поток фрибетов по дням",
-            xaxis_title="День",
-            yaxis_title="Фрибеты",
-            hovermode="x unified",
-        )
-        st.plotly_chart(fig_fb_flow, use_container_width=True)
-
+        fb_summary = iteration_df.groupby("iteration").agg(
+            freebet_balance_start=("freebet_balance_start", "median"),
+            freebets_issued=("freebets_issued", "median"),
+            freebets_spent=("freebets_spent", "median"),
+            freebet_balance_end=("freebet_balance_end", "median"),
+        ).reset_index()
+        fig_flow = go.Figure()
+        fig_flow.add_trace(go.Scatter(x=fb_summary["iteration"], y=fb_summary["freebets_issued"], mode="lines+markers", name="Выдано фрибетов"))
+        fig_flow.add_trace(go.Scatter(x=fb_summary["iteration"], y=fb_summary["freebets_spent"], mode="lines+markers", name="Использовано фрибетов"))
+        fig_flow.update_layout(title="Выдача и использование фрибетов по итерациям", xaxis_title="Итерация", yaxis_title="Фрибеты", hovermode="x unified")
+        st.plotly_chart(fig_flow, use_container_width=True)
         fig_balance = go.Figure()
-        fig_balance.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["aor_balance"],
-                mode="lines",
-                name="AOR-баланс",
-            )
-        )
-        fig_balance.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["initial_balance"],
-                mode="lines",
-                name="Стартовый баланс",
-            )
-        )
-        fig_balance.add_trace(
-            go.Scatter(
-                x=freebet_daily_summary["day"],
-                y=freebet_daily_summary["total_balance"],
-                mode="lines",
-                name="Итого баланс",
-            )
-        )
-        fig_balance.update_layout(
-            title="Медианный баланс фрибетов на конец дня",
-            xaxis_title="День",
-            yaxis_title="Фрибеты",
-            hovermode="x unified",
-        )
+        fig_balance.add_trace(go.Scatter(x=fb_summary["iteration"], y=fb_summary["freebet_balance_start"], mode="lines+markers", name="Баланс на начало"))
+        fig_balance.add_trace(go.Scatter(x=fb_summary["iteration"], y=fb_summary["freebet_balance_end"], mode="lines+markers", name="Баланс на конец"))
+        fig_balance.update_layout(title="Баланс фрибетов по итерациям", xaxis_title="Итерация", yaxis_title="Фрибеты", hovermode="x unified")
         st.plotly_chart(fig_balance, use_container_width=True)
-
-        fig_missions = px.bar(
-            freebet_daily_summary,
-            x="day",
-            y="completed_missions",
-            title="Медианное количество выполненных миссий по дням",
-        )
-        fig_missions.update_layout(xaxis_title="День", yaxis_title="Миссии")
-        st.plotly_chart(fig_missions, use_container_width=True)
 
     with tab3:
         d1, d2 = st.columns(2)
-
         with d1:
-            fig_roi = px.histogram(
-                metrics_df,
-                x="roi_after_spent",
-                nbins=40,
-                title="Распределение ROI по использованным AOR-фрибетам",
-            )
+            fig_roi = px.histogram(metrics_df, x="roi_after_spent", nbins=40, title="Распределение ROI по использованным фрибетам")
             fig_roi.update_layout(xaxis_title="ROI", yaxis_title="Симуляции")
             st.plotly_chart(fig_roi, use_container_width=True)
-
         with d2:
-            fig_issued = px.histogram(
-                metrics_df,
-                x="aor_freebets_issued_per_active_user",
-                nbins=40,
-                title="Распределение AOR-фрибетов, выданных на active user",
-            )
-            fig_issued.update_layout(xaxis_title="AOR-фрибеты выданы / active user", yaxis_title="Симуляции")
+            fig_issued = px.histogram(metrics_df, x="freebets_issued_per_active_user", nbins=40, title="Распределение выданных фрибетов на active user")
+            fig_issued.update_layout(xaxis_title="Фрибеты выданы / active user", yaxis_title="Симуляции")
             st.plotly_chart(fig_issued, use_container_width=True)
-
         d3, d4 = st.columns(2)
-
         with d3:
-            fig_spent = px.histogram(
-                metrics_df,
-                x="aor_freebets_spent_per_active_user",
-                nbins=40,
-                title="Распределение AOR-фрибетов, использованных на active user",
-            )
-            fig_spent.update_layout(xaxis_title="AOR-фрибеты использованы / active user", yaxis_title="Симуляции")
+            fig_spent = px.histogram(metrics_df, x="freebets_spent_per_active_user", nbins=40, title="Распределение использованных фрибетов на active user")
+            fig_spent.update_layout(xaxis_title="Фрибеты использованы / active user", yaxis_title="Симуляции")
             st.plotly_chart(fig_spent, use_container_width=True)
-
         with d4:
-            fig_balance = px.histogram(
-                metrics_df,
-                x="aor_freebets_end_balance_per_active_user",
-                nbins=40,
-                title="Распределение остатка AOR-фрибетов на active user",
-            )
-            fig_balance.update_layout(xaxis_title="AOR-фрибеты на конец / active user", yaxis_title="Симуляции")
+            fig_balance = px.histogram(metrics_df, x="final_freebet_balance_per_active_user", nbins=40, title="Распределение остатка фрибетов на active user")
+            fig_balance.update_layout(xaxis_title="Фрибеты на конец / active user", yaxis_title="Симуляции")
             st.plotly_chart(fig_balance, use_container_width=True)
 
     with tab4:
         summary_df = build_summary(metrics_df)
         st.dataframe(format_summary(summary_df), use_container_width=True)
-
-        st.download_button(
-            "Скачать сводную таблицу CSV",
-            data=summary_df.to_csv(index=False).encode("utf-8"),
-            file_name="aor_summary_ru.csv",
-            mime="text/csv",
-        )
+        st.download_button("Скачать сводную таблицу CSV", data=summary_df.to_csv(index=False).encode("utf-8"), file_name="aor_iterations_summary_ru.csv", mime="text/csv")
 
     with tab5:
+        st.markdown("**Итоги по симуляциям**")
         st.dataframe(metrics_df, use_container_width=True)
-
-        st.download_button(
-            "Скачать данные симуляций CSV",
-            data=metrics_df.to_csv(index=False).encode("utf-8"),
-            file_name="aor_raw_simulations_ru.csv",
-            mime="text/csv",
-        )
+        st.download_button("Скачать итоги симуляций CSV", data=metrics_df.to_csv(index=False).encode("utf-8"), file_name="aor_simulation_totals_ru.csv", mime="text/csv")
+        st.markdown("**Данные по итерациям**")
+        st.dataframe(iteration_df, use_container_width=True)
+        st.download_button("Скачать данные по итерациям CSV", data=iteration_df.to_csv(index=False).encode("utf-8"), file_name="aor_iteration_results_ru.csv", mime="text/csv")
 
     st.subheader("Логика модели")
-    st.code(
-        """
-Базовая экономика:
-average_stake = turnover / bets
-hold = GGR / turnover
-GGR_per_bet = GGR / bets
+    st.code("""
+На старте:
+freebet_balance_0 = 0
 
-Распределение ставок:
-user_bet_weight ~ усечённое распределение Гаусса(mean=1, std=user_bet_cv)
-baseline_user_bets_30d = total_bets / active_users * user_bet_weight
-
-Воронка AOR:
-targeted_user = выбран системой
-activated_user = принял миссию
-completed_user = выполнил хотя бы 1 миссию
-
-Миссии:
-missions_per_completed_user = 1 + Poisson(avg_missions_per_completed_user - 1)
-missions_per_completed_user <= max_missions_per_completed_user
-
-Рост:
-AOR bets = baseline bets * (1 + рост количества ставок у completed users)
-AOR stake = baseline average stake * (1 + рост средней ставки у completed users)
-AOR hold = baseline hold * (1 + изменение hold у completed users)
-
-Дополнительная прибыль:
-incremental_ggr_gross = AOR gross GGR - baseline GGR
-
-Ограничение бюджета:
-max_reward_budget = max(0, incremental_ggr_gross)
-planned_reward_budget = max_reward_budget * reward_budget_share
-planned_reward_budget <= incremental_ggr_gross
-
-Coins и фрибеты:
-1 Coin = 1 фрибет = €1 бонусного бюджета
-coins_total = floor(planned_reward_budget / 1)
-aor_freebets_issued_total = coins_total
-
-Выдача по миссиям:
-coins_per_completed_mission = coins_total / completed_missions_total
-
-Стартовые фрибеты:
-initial_freebets_total = initial_freebets_per_active_user * active_users
-
-Траты фрибетов:
-каждый день списывается daily_freebet_spend_rate от доступного баланса
-стартовые фрибеты и AOR-фрибеты считаются отдельно
-
-Эффективность:
-program_cost_spent = использованные AOR-фрибеты * €1
-program_cost_issued = выданные AOR-фрибеты * €1
-
-net_ggr_after_spent = incremental_ggr_gross - program_cost_spent
-conservative_net_ggr = incremental_ggr_gross - program_cost_issued
-
-roi_after_spent = net_ggr_after_spent / program_cost_spent
-roi_conservative = conservative_net_ggr / program_cost_issued
-        """,
-        language="text",
-    )
+Для каждой итерации k:
+baseline_ggr_k = total_ggr * iteration_weight_k
+incremental_ggr_gross_k = aor_ggr_gross_k - baseline_ggr_k
+max_reward_budget_k = max(0, incremental_ggr_gross_k)
+planned_reward_budget_k = max_reward_budget_k * reward_budget_share
+coins_issued_k = floor(planned_reward_budget_k / EUR1)
+freebets_issued_k = coins_issued_k
+freebet_balance_after_issue_k = freebet_balance_start_k + freebets_issued_k
+freebets_spent_k = freebet_balance_after_issue_k * freebet_spend_rate_per_iteration
+freebet_balance_end_k = freebet_balance_after_issue_k - freebets_spent_k
+freebet_balance_start_{k+1} = freebet_balance_end_k
+program_cost_spent_k = freebets_spent_k * EUR1
+program_cost_issued_k = freebets_issued_k * EUR1
+net_ggr_after_spent_k = incremental_ggr_gross_k - program_cost_spent_k
+conservative_net_ggr_k = incremental_ggr_gross_k - program_cost_issued_k
+    """, language="text")
 
 
 if __name__ == "__main__":

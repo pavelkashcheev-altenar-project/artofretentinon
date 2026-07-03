@@ -1,55 +1,31 @@
-# AOR — симуляционная модель с миссиями, Coins и фрибетами
+# AOR — итерационная модель Coins и фрибетов
 
 Русская версия Streamlit-дашборда для Art of Retention.
 
-## Что учитывает эта версия
+## Главное изменение
 
-1. **Пользователь может выполнить больше одной миссии в месяц.**
+Модель теперь состоит из нескольких итераций. Количество итераций задаётся в дашборде.
+
+На старте у пользователей:
 
 ```text
-missions_per_completed_user = 1 + Poisson(avg_missions_per_completed_user - 1)
+Freebet Balance = 0
 ```
 
-Количество миссий ограничивается параметром:
+На каждой итерации пользователи могут:
 
 ```text
-max_missions_per_completed_user
+получить Coins / фрибеты
+использовать часть доступного баланса
+перенести остаток на следующую итерацию
 ```
 
-2. **У пользователей есть стартовые фрибеты в начале симуляции.**
+## Ограничение
+
+На каждой итерации:
 
 ```text
-initial_freebets_total = initial_freebets_per_active_user × active_users
-```
-
-3. **Пользователи могут тратить фрибеты в течение симуляции.**
-
-Каждый день списывается заданная доля доступного баланса:
-
-```text
-daily_freebet_spend_rate
-```
-
-Стартовые фрибеты и AOR-фрибеты считаются отдельно.
-
-4. **Coins и AOR-фрибеты не вводятся вручную.**
-
-Они рассчитываются из дополнительного gross GGR:
-
-```text
-Max Reward Budget = max(0, Incremental Gross GGR)
-
-Planned Reward Budget = Max Reward Budget × Reward Budget Share
-
-Coins = floor(Planned Reward Budget / €1)
-
-AOR Freebets Issued = Coins
-```
-
-## Главное ограничение
-
-```text
-Стоимость выданных Coins / AOR-фрибетов не может превышать дополнительную прибыль от программы.
+Стоимость выданных Coins / фрибетов <= Incremental Gross GGR итерации
 ```
 
 ## Фиксированное правило текущей версии
@@ -63,12 +39,4 @@ AOR Freebets Issued = Coins
 ```bash
 pip install -r requirements.txt
 streamlit run aor_retention_dashboard_ru.py
-```
-
-## Файлы
-
-```text
-aor_retention_dashboard_ru.py
-requirements.txt
-README.md
 ```
