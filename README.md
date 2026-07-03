@@ -1,26 +1,40 @@
-# AOR — симуляционная модель с расчётом Coins и фрибетов
+# AOR — симуляционная модель с миссиями, Coins и фрибетами
 
 Русская версия Streamlit-дашборда для Art of Retention.
 
-## Главное изменение
+## Что учитывает эта версия
 
-Coins и фрибеты больше не вводятся вручную.
-
-Модель сама рассчитывает максимальное и плановое количество Coins / фрибетов на основе дополнительной прибыли от применения программы.
-
-Главное ограничение:
+1. **Пользователь может выполнить больше одной миссии в месяц.**
 
 ```text
-Стоимость Coins / фрибетов не может превышать Incremental Gross GGR
+missions_per_completed_user = 1 + Poisson(avg_missions_per_completed_user - 1)
 ```
 
-## Фиксированное правило текущей версии
+Количество миссий ограничивается параметром:
 
 ```text
-1 Coin = 1 фрибет = €1 бонусного бюджета
+max_missions_per_completed_user
 ```
 
-## Как считается
+2. **У пользователей есть стартовые фрибеты в начале симуляции.**
+
+```text
+initial_freebets_total = initial_freebets_per_active_user × active_users
+```
+
+3. **Пользователи могут тратить фрибеты в течение симуляции.**
+
+Каждый день списывается заданная доля доступного баланса:
+
+```text
+daily_freebet_spend_rate
+```
+
+Стартовые фрибеты и AOR-фрибеты считаются отдельно.
+
+4. **Coins и AOR-фрибеты не вводятся вручную.**
+
+Они рассчитываются из дополнительного gross GGR:
 
 ```text
 Max Reward Budget = max(0, Incremental Gross GGR)
@@ -29,13 +43,19 @@ Planned Reward Budget = Max Reward Budget × Reward Budget Share
 
 Coins = floor(Planned Reward Budget / €1)
 
-Freebets = Coins
+AOR Freebets Issued = Coins
+```
 
-Program Cost = Coins × €1
+## Главное ограничение
 
-Net Incremental GGR = Incremental Gross GGR - Program Cost
+```text
+Стоимость выданных Coins / AOR-фрибетов не может превышать дополнительную прибыль от программы.
+```
 
-ROI = Net Incremental GGR / Program Cost
+## Фиксированное правило текущей версии
+
+```text
+1 Coin = 1 фрибет = €1 бонусного бюджета
 ```
 
 ## Запуск
@@ -52,24 +72,3 @@ aor_retention_dashboard_ru.py
 requirements.txt
 README.md
 ```
-
-
-## Дефолтные исходные данные
-
-```text
-Ставок за период: 5,483,458
-Оборот: €40,834,160
-GGR: €4,682,582
-Users: 372,326
-```
-
-
-## Обновление
-
-В блок `Результаты симуляции` добавлена карточка:
-
-```text
-Изменение GGR
-```
-
-Карточка показывает среднее абсолютное изменение GGR в евро, а в delta — медианное процентное изменение к baseline GGR.
